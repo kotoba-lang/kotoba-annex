@@ -60,7 +60,22 @@ private datasets), `encryption=none` for public/regenerable content.
 - `bin/git-annex-remote-kotobase.cljs` — the executable git-annex invokes
   (stdin/stdout protocol loop).
 
-## kotobase.net backend — **動作確認済み**（2026-07-17 実測）
+## kotobase.net backend — **動く。が、層を誤っている**（2026-07-17 実測 + 設計評価）
+
+> **先に読むこと**: この backend は実 git-annex → 実 kotobase.net で往復検証済み
+> （下記）だが、**ストレージ層の選択が誤っている**。`net.kotobase.store`(istore) の
+> 実体は **Cloudflare KV**（`TENANT_STATE`、**billing/funnel カウンタと同居**）で、
+> 小さい値・読み取り主体の**ドキュメント面**であって blob 面ではない。下の
+> 「必須事項」に並ぶ制約（chunk 必須 / 191KB timeout / ~25KB/s / max 900KB）は
+> **全てこの層ミスの症状**であり、本来必要な制約ではない。
+> **本番の大量アップロードにこの backend を使わない**（22.5MB ≒ ~700 chunk が
+> billing KV 名前空間に書き込まれる）。恒久保存は当面 `directory` store か B2 を使う。
+> 正しい面は kotobase に既にある — `PUT /ipfs/:cid`（`archive_put.cljc`: raw
+> CIDv1(sha2-256) を認証付きで **B2 archive** へ直接）。annex key
+> `SHA256E-s<size>--<sha256>` は CIDv1(raw, sha2-256) へ機械変換できるので直接噛み合い、
+> chunk も base64 も DAG-CBOR も要らなくなる。張り替えは follow-up（ADR-2607175000）。
+
+### 検証内容（「動く」ことの証明。「適切」の証明ではない）
 
 **訂正**: 当初は kotobase-server に blob 面を足す設計だったが、net-kotobase の live
 worker は kotobase-server ではなく `kotobase.istore` を使っており、
@@ -85,14 +100,19 @@ git annex fsck asset.wav                             # content integrity ok
 STORE ok / RETRIEVE (checksum) ok / fsck ok。tenant を `store.list` すると chunk
 `SHA256E-s95788-S32768-C1..C3--…` が実在。
 
-### 実装上の必須事項（実測で判明した罠 2 つ）
+### 実装上の必須事項（実測で判明。1 は層ミスの症状、2–3 は本物）
 
 1. **`chunk=` は必須**。istore の `max-value-bytes` は 900000 だが、実測では 191KB の
    単一 put が 2 分超で timeout。**32KiB chunk で安定**（1KB/32KB は即応）。
+   ⚠ これは KV の write latency + グローバル伝播に起因する**層ミスの症状**で、
+   B2 archive（`/ipfs/:cid`）へ張り替えれば不要になる。
 2. **不在キーでも HTTP 200 が返る**（body が `{"ok":false,"error":"NotFound"}`）。
-   HTTP status だけで present 判定すると **不在キーを present と誤答 → git-annex が
-   STORE を丸ごとスキップし「保存したのに空」**になる。必ず **body の `ok`/`val`** を
-   見る（回帰テスト `absent-key-returns-http200-with-error-body` で固定）。
+   これは **XRPC(atproto) の作法であり kotobase の欠陥ではない** — HTTP status で
+   判定した**こちらのクライアントが誤りだった**。誤ると **不在キーを present と誤答 →
+   git-annex が STORE を丸ごとスキップし「copy は ok と言うのに実際は空」**になる。
+   必ず **body の `ok`/`val`** を見る（回帰テスト
+   `absent-key-returns-http200-with-error-body` で固定）。backend を替えても
+   「HTTP status を成功判定に使わない」は維持する。
 3. **stdin close で即 `process.exit` しない**。実行中の非同期 STORE/RETRIEVE が応答
    前に殺される。in-flight を追跡し全完了後に exit する（bin の `track!`）。
 
@@ -100,8 +120,9 @@ STORE ok / RETRIEVE (checksum) ok / fsck ok。tenant を `store.list` すると 
 
 | backend | 状態 | 用途 |
 |---|---|---|
-| `directory`（既定） | ✓ 全操作 + 暗号化を実 git-annex 検証済み | ローカル / オフライン / CI |
-| `kotobase.net`（`KOTOBASE_ENDPOINT` 設定時） | ✓ 実 git-annex → 実 kotobase.net で往復検証済み（`chunk=32KiB` 必須） | 共有・恒久保存 |
+| `directory`（既定） | ✓ 全操作 + 暗号化を実 git-annex 検証済み | ローカル / オフライン / CI / **当面の恒久保存の正本** |
+| `kotobase.net`（`KOTOBASE_ENDPOINT` 設定時） | △ 往復は検証済みだが **層が誤り**（istore = billing と同居の Cloudflare KV。`chunk=32KiB` 必須、~25KB/s） | **実験・小さい検証のみ。大量アップロードに使わない** |
+| kotobase `PUT /ipfs/:cid`（B2 archive） | ✗ 未実装（**あるべき経路**。面自体は kotobase 側に実在） | 共有・恒久保存（follow-up、ADR-2607175000） |
 | B2 S3 special remote | 既存（`m365-archive` 先例、本 remote 非経由） | 大容量アーカイブ |
 
 ## Test
