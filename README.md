@@ -60,7 +60,31 @@ private datasets), `encryption=none` for public/regenerable content.
 - `bin/git-annex-remote-kotobase.cljs` — the executable git-annex invokes
   (stdin/stdout protocol loop).
 
-## kotobase.net backend — status
+## kotobase.net backend — status (2026-07-17 実測)
+
+**訂正**: 当初は kotobase-server に blob 面を足す設計だったが、net-kotobase の live
+worker は kotobase-server ではなく `kotobase.istore` を使っており、
+**`net.kotobase.store.{put,get,list,append,read}` は既に kotobase.net で live**
+（未認証で叩くと `{"ok":false,"error":"Unauthorized"}` = 面は存在、認証待ち）。
+よって **server 変更も deploy も不要**。
+
+| 検証項目 | 実測 |
+|---|---|
+| CACAO 自己発行（自鍵 → did:key、aud=`did:web:kotobase.net`） | ✓ mint 成功 |
+| 実 kotobase.net へ direct store→present→retrieve（5B / 1KB / 32KB） | ✓ 完全往復 |
+| 実 kotobase.net へ direct store（191KB） | ⚠ 2 分超で timeout（大きい値は実用外） |
+| **git-annex → kotobase.net（STORE/RETRIEVE）** | ✗ **未達**（下記） |
+
+**未解決**: git-annex 経由の STORE が **実際には永続化されていない**（tenant を
+`store.list` すると chunk キーが 1 つも無い）のに、`git annex copy` が ok を返した
+ケースがある = bin の async 応答が実完了前に success を返している疑い。RETRIEVE は
+20ms で TRANSFER-FAILURE（データ不在）。**「動いている」とは言えない状態**なので、
+kotobase backend は実運用に使わないこと。directory store は全操作検証済みで実用可。
+
+次の一手: bin の STORE 応答が store! の Promise 完了を正しく待つか検証（readline の
+行ハンドラと process 終了の競合を疑う）、および大きい値の実用サイズ上限の確定。
+
+## backend 一覧
 
 The directory backend is fully working & verified. The **kotobase.net backend
 client is written and unit-tested (mock fetch)** but needs one server-side piece:

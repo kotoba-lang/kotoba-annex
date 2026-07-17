@@ -1,58 +1,100 @@
 (ns kotoba.annex.kotobase
-  "kotobase.net backed の store — git-annex の annex key（content-address）を
-   kotobase の content-addressed block store に永続化する。**同じ store 契約**
-   （kotoba.annex.store）なので directory store と差し替え可能。
+  "kotobase.net backed の store — git-annex の annex key を kotobase.net の
+   **実在・deploy 済みの `net.kotobase.store.*` 面**（tenant 隔離 IStore、
+   DAG-CBOR ブロック + CID、`kotobase.istore`）に永続化する。
+   kotoba.annex.store と同じ store 契約なので directory store と差し替え可能。
 
-   kotobase-server の store 契約（handler.cljc で確認）:
-     :put!     (fn [cid bytes])  block を cid で書く
-     :get-fn   (fn [cid])        block bytes | nil
-     :head-put!(fn [graph chain]) 名前付き head の CAS
-     :head-get (fn [graph])      chain-cid | nil
-   annex key はそれ自体が内容ハッシュ（SHA256E-s<size>--<hash>）なので、
-   cid にそのまま使え衝突しない。present? は blob head で判定。
+   **重要な訂正（2026-07-17 実測）**: 当初は kotobase-server に blob 面を足して
+   使う設計だったが、net-kotobase の live worker は kotobase-server ではなく
+   `kotobase.istore` を使っており、`net.kotobase.store.{put,get,list,append,read}`
+   は **既に kotobase.net で live**（未認証で叩くと `{\"ok\":false,\"error\":
+   \"Unauthorized\"}` = 面は存在、認証待ち。実測で確認）。よって **server 変更も
+   deploy も不要**で、既存面に CACAO 認証で書く。
 
-   ⚠ kotobase-server の**公開 XRPC 面は datomic 系**（datoms/transact/q/...）で、
-   raw block の put/get は注入 store の内部契約。git-annex から直接使うには
-   kotobase-server に blob 面（ai.gftd.apps.kotobase.blob.{put,get,head,remove}、
-   store の put!/get-fn を薄く公開）を1つ追加する必要がある — これは server 側の
-   小追加 + deploy（owner-gated、ADR の follow-up）。本 client はその blob 面の
-   HTTP 契約に対して書いてあり、mock fetch で単体テスト可能。"
-  (:require ["fs" :as fs]))
+   認証は **CACAO 自己発行**（skill build-actor）: actor が自分の Ed25519 鍵を生成し、
+   その did:key が自分の graph。`proxy/resolve-viewer` は CACAO を検証して did を
+   取り出すだけ（resources は見ない）ので、**自分の鍵 → 自分の tenant 名前空間**で
+   完結し、owner の token 受け渡しは要らない。
+     aud       = did:web:kotobase.net（pod が enforce、mismatch は 'cacao audience
+                 mismatch' で拒否）
+     resources = kotoba://op/datom:read + datom:transact + kotoba://graph/<graph>
+     headers   = authorization: CACAO <b64> / x-kotoba-did: <iss>
 
-;; --- blob XRPC 契約（kotobase-server に追加する面。put!/get-fn/head の薄い公開）---
-;; POST <endpoint>/xrpc/ai.gftd.apps.kotobase.blob.put   body: bytes  ?graph=&key=
-;; GET  <endpoint>/xrpc/ai.gftd.apps.kotobase.blob.get   ?graph=&key=  -> bytes|404
-;; GET  <endpoint>/xrpc/ai.gftd.apps.kotobase.blob.head  ?graph=&key=  -> 200|404
-;; POST <endpoint>/xrpc/ai.gftd.apps.kotobase.blob.remove ?graph=&key=
+   ⚠ 値サイズ上限: istore の `max-value-bytes` = 900000（900KB）。大きいファイルは
+   git-annex の chunking（`chunk=500KiB`）で分割する — 各 chunk が上限内に収まる。"
+  (:require [cacao.core :as cacao]
+            [kotoba.annex.identity :as ident]))
 
-(defn- url [endpoint method graph key]
-  (str endpoint "/xrpc/ai.gftd.apps.kotobase.blob." method
-       "?graph=" (js/encodeURIComponent graph) "&key=" (js/encodeURIComponent key)))
+(def ^:const default-endpoint "https://kotobase.net")
+(def ^:const kotobase-aud "did:web:kotobase.net")
+(def ^:const annex-coll "annex")
+(def ^:const max-value-bytes 900000)
+
+(defn kotobase-resources
+  "kotobase graph の CACAO resource scope（cloud-itonami identity-core と同型）。"
+  [graph]
+  [(str "kotoba://op/datom:read")
+   (str "kotoba://op/datom:transact")
+   (str "kotoba://graph/" graph)])
+
+(defn mint-auth
+  "自分の鍵で kotobase.net 向け CACAO を自己発行し、認証ヘッダを返す。
+   graph 既定は自分の did:key（自己所有 graph）。"
+  [{:keys [identity graph ttl-seconds] :or {ttl-seconds (* 24 3600)}}]
+  (let [{:keys [seed did]} identity
+        g (or graph did)
+        now (js/Math.floor (/ (js/Date.now) 1000))
+        iso #(.toISOString (js/Date. (* 1000 %)))
+        minted (cacao/mint {:seed seed
+                            :aud kotobase-aud
+                            :iat (iso now)
+                            :exp (iso (+ now ttl-seconds))
+                            :nonce (str (random-uuid))
+                            :resources (kotobase-resources g)})]
+    (assoc (cacao/auth-header minted) :iss (:iss minted) :graph g)))
+
+(defn- headers [auth]
+  #js {"authorization" (:authorization auth)
+       "x-kotoba-did" (:x-kotoba-did auth)
+       "content-type" "application/json"})
+
+(defn- xrpc [endpoint method auth body fetch]
+  (fetch (str endpoint "/xrpc/net.kotobase.store." method)
+         #js {:method "POST" :headers (headers auth)
+              :body (js/JSON.stringify (clj->js body))}))
+
+(defn- b64 [u8] (.toString (js/Buffer.from u8) "base64"))
+(defn- unb64 [s] (js/Buffer.from s "base64"))
 
 (defn kotobase-store
-  "opts: {:endpoint \"https://kotobase.net\" :graph \"dougaka-kagaku-assets\"
-          :fetch <fn>（省略時 js/fetch。テストで mock 注入）
-          :sync? bool（true で await 同期化。既定は Promise を返すので bin 側で await）}。
-   本 store の関数は Promise を返す — bin 側で await して応答を組む。"
-  [{:keys [endpoint graph fetch] :or {fetch js/fetch}}]
-  {:endpoint endpoint :graph graph
-   :store!   (fn [key bytes]
-               (-> (fetch (url endpoint "put" graph key)
-                          #js {:method "POST" :body bytes})
-                   (.then #(.-ok %))))
-   :retrieve (fn [key]
-               (-> (fetch (url endpoint "get" graph key))
-                   (.then (fn [r] (if (.-ok r) (.arrayBuffer r) nil)))
-                   (.then (fn [buf] (when buf (js/Buffer.from buf))))))
-   :present? (fn [key]
-               (-> (fetch (url endpoint "head" graph key))
-                   (.then (fn [r] (if (.-ok r) :yes :no)))
-                   (.catch (fn [_] :unknown))))
-   :remove!  (fn [key]
-               (-> (fetch (url endpoint "remove" graph key) #js {:method "POST"})
-                   (.then #(.-ok %))))
-   :init!    (fn [] true)
-   :prepare! (fn [config]
-               (when-not (and endpoint graph)
-                 (throw (js/Error. "kotobase store needs :endpoint and :graph")))
-               true)})
+  "opts: {:endpoint :graph :identity :fetch}。identity 省略時は自己生成/読込。
+   store 契約の関数は Promise を返す（bin 側で await）。"
+  [{:keys [endpoint graph identity fetch]
+    :or {endpoint default-endpoint fetch js/fetch}}]
+  (let [id (or identity (ident/load-or-create-identity!))
+        auth (atom nil)
+        auth! (fn [] (or @auth (reset! auth (mint-auth {:identity id :graph graph}))))]
+    {:endpoint endpoint :did (:did id)
+     :store!   (fn [key bytes]
+                 (when (> (.-length bytes) max-value-bytes)
+                   (throw (js/Error. (str "value > istore max-value-bytes (" max-value-bytes
+                                          ") — use git-annex chunk=500KiB"))))
+                 (-> (xrpc endpoint "put" (auth!) {:coll annex-coll :key key
+                                                   :val (b64 bytes)} fetch)
+                     (.then #(.-ok %))))
+     :retrieve (fn [key]
+                 (-> (xrpc endpoint "get" (auth!) {:coll annex-coll :key key} fetch)
+                     (.then (fn [r] (if (.-ok r) (.json r) nil)))
+                     (.then (fn [j] (when-let [v (some-> j (aget "val"))] (unb64 v))))))
+     :present? (fn [key]
+                 (-> (xrpc endpoint "get" (auth!) {:coll annex-coll :key key} fetch)
+                     (.then (fn [r] (if (.-ok r) :yes :no)))
+                     (.catch (fn [_] :unknown))))
+     ;; istore は delete を持たない（content-addressed / append 指向）。REMOVE は
+     ;; tombstone を put して present? を false にする（kotobase-server blob 面と同型）。
+     :remove!  (fn [key]
+                 (-> (xrpc endpoint "put" (auth!) {:coll annex-coll
+                                                   :key (str "tomb:" key) :val "1"} fetch)
+                     (.then #(.-ok %))))
+     :init!    (fn [] true)
+     :prepare! (fn [_config] (auth!) true)}))
