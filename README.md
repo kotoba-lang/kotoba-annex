@@ -60,29 +60,41 @@ private datasets), `encryption=none` for public/regenerable content.
 - `bin/git-annex-remote-kotobase.cljs` — the executable git-annex invokes
   (stdin/stdout protocol loop).
 
-## kotobase.net backend — status (2026-07-17 実測)
+## kotobase.net backend — **動作確認済み**（2026-07-17 実測）
 
 **訂正**: 当初は kotobase-server に blob 面を足す設計だったが、net-kotobase の live
 worker は kotobase-server ではなく `kotobase.istore` を使っており、
-**`net.kotobase.store.{put,get,list,append,read}` は既に kotobase.net で live**
-（未認証で叩くと `{"ok":false,"error":"Unauthorized"}` = 面は存在、認証待ち）。
-よって **server 変更も deploy も不要**。
+**`net.kotobase.store.{put,get,list,append,read}` は既に kotobase.net で live**。
+よって **server 変更も deploy も不要**だった。
 
-| 検証項目 | 実測 |
-|---|---|
-| CACAO 自己発行（自鍵 → did:key、aud=`did:web:kotobase.net`） | ✓ mint 成功 |
-| 実 kotobase.net へ direct store→present→retrieve（5B / 1KB / 32KB） | ✓ 完全往復 |
-| 実 kotobase.net へ direct store（191KB） | ⚠ 2 分超で timeout（大きい値は実用外） |
-| **git-annex → kotobase.net（STORE/RETRIEVE）** | ✗ **未達**（下記） |
+認証は **CACAO 自己発行** — actor が自分の Ed25519 鍵を生成し、鍵由来 did:key が
+自分の graph（skill build-actor）。`resolve-viewer` は CACAO を検証して did を取り
+出すだけなので、**自分の鍵 → 自分の tenant** で完結し owner の token 受け渡しは不要。
 
-**未解決**: git-annex 経由の STORE が **実際には永続化されていない**（tenant を
-`store.list` すると chunk キーが 1 つも無い）のに、`git annex copy` が ok を返した
-ケースがある = bin の async 応答が実完了前に success を返している疑い。RETRIEVE は
-20ms で TRANSFER-FAILURE（データ不在）。**「動いている」とは言えない状態**なので、
-kotobase backend は実運用に使わないこと。directory store は全操作検証済みで実用可。
+```sh
+export KOTOBASE_ENDPOINT=https://kotobase.net       # これだけで kotobase backend
+git annex initremote kb type=external externaltype=kotobase \
+    encryption=none chunk=32KiB                      # chunk は必須（下記）
+git annex copy asset.wav --to kb                     # STORE  -> ok
+git annex drop asset.wav --force
+git annex get  asset.wav --from kb                   # RETRIEVE -> (checksum...) ok
+git annex fsck asset.wav                             # content integrity ok
+```
 
-次の一手: bin の STORE 応答が store! の Promise 完了を正しく待つか検証（readline の
-行ハンドラと process 終了の競合を疑う）、および大きい値の実用サイズ上限の確定。
+**実測（kagaku の合成音声 95,788 bytes、実 git-annex v10 → 実 kotobase.net）**:
+STORE ok / RETRIEVE (checksum) ok / fsck ok。tenant を `store.list` すると chunk
+`SHA256E-s95788-S32768-C1..C3--…` が実在。
+
+### 実装上の必須事項（実測で判明した罠 2 つ）
+
+1. **`chunk=` は必須**。istore の `max-value-bytes` は 900000 だが、実測では 191KB の
+   単一 put が 2 分超で timeout。**32KiB chunk で安定**（1KB/32KB は即応）。
+2. **不在キーでも HTTP 200 が返る**（body が `{"ok":false,"error":"NotFound"}`）。
+   HTTP status だけで present 判定すると **不在キーを present と誤答 → git-annex が
+   STORE を丸ごとスキップし「保存したのに空」**になる。必ず **body の `ok`/`val`** を
+   見る（回帰テスト `absent-key-returns-http200-with-error-body` で固定）。
+3. **stdin close で即 `process.exit` しない**。実行中の非同期 STORE/RETRIEVE が応答
+   前に殺される。in-flight を追跡し全完了後に exit する（bin の `track!`）。
 
 ## backend 一覧
 

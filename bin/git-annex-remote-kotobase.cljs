@@ -84,7 +84,31 @@
         (out "UNSUPPORTED-REQUEST")))))
 
 ;; 起動: VERSION を送ってから行ループ
+;;
+;; ⚠ stdin close で即 `process.exit` してはいけない — 実行中の非同期 STORE/RETRIEVE
+;; （kotobase store は fetch を待つ）が**応答を返す前に殺され、git-annex から見ると
+;; 「保存されたはずが実際には空」**になる（2026-07-17 実測でこの不具合を確認: 手動で
+;; プロトコルを流すと TRANSFER STORE に応答が出ずプロセスが終了。stdin を保持すると
+;; TRANSFER-SUCCESS が出て実データも保存されていた）。close 時は in-flight を待つ。
 (out proto/hello)
+
+(def inflight (atom #{}))
+(def closed? (atom false))
+
+(defn track!
+  "非同期処理を追跡する。close 後に全て完了したら exit する。"
+  [pr]
+  (let [id (random-uuid)]
+    (swap! inflight conj id)
+    (-> (js/Promise.resolve pr)
+        (.finally (fn []
+                    (swap! inflight disj id)
+                    (when (and @closed? (empty? @inflight))
+                      (js/process.exit 0)))))))
+
 (def rl (readline/createInterface #js {:input js/process.stdin}))
-(.on rl "line" handle-line)
-(.on rl "close" (fn [] (js/process.exit 0)))
+(.on rl "line" (fn [line] (track! (handle-line line))))
+(.on rl "close" (fn []
+                  (reset! closed? true)
+                  ;; in-flight が無ければ即 exit、あれば最後の完了時に exit
+                  (when (empty? @inflight) (js/process.exit 0))))

@@ -82,13 +82,22 @@
                  (-> (xrpc endpoint "put" (auth!) {:coll annex-coll :key key
                                                    :val (b64 bytes)} fetch)
                      (.then #(.-ok %))))
+     ;; ⚠ **HTTP 200 + エラー body の罠**（2026-07-17 実測）: net.kotobase.store.get は
+     ;; キーが無くても **HTTP 200** を返し、body が `{"ok":false,"error":"NotFound"}`。
+     ;; `.ok`（HTTP status）だけで判定すると **不在キーを present と誤答**し、
+     ;; git-annex は「もう持っている」と見なして **STORE を丸ごとスキップ**する
+     ;; （= 何も保存されないのに copy は成功に見える）。必ず **body の :ok と :val** を見る。
      :retrieve (fn [key]
                  (-> (xrpc endpoint "get" (auth!) {:coll annex-coll :key key} fetch)
                      (.then (fn [r] (if (.-ok r) (.json r) nil)))
-                     (.then (fn [j] (when-let [v (some-> j (aget "val"))] (unb64 v))))))
+                     (.then (fn [j]
+                              (when (and j (aget j "ok"))
+                                (when-let [v (aget j "val")] (unb64 v)))))))
      :present? (fn [key]
                  (-> (xrpc endpoint "get" (auth!) {:coll annex-coll :key key} fetch)
-                     (.then (fn [r] (if (.-ok r) :yes :no)))
+                     (.then (fn [r] (if (.-ok r) (.json r) nil)))
+                     (.then (fn [j]
+                              (if (and j (aget j "ok") (some? (aget j "val"))) :yes :no)))
                      (.catch (fn [_] :unknown))))
      ;; istore は delete を持たない（content-addressed / append 指向）。REMOVE は
      ;; tombstone を put して present? を false にする（kotobase-server blob 面と同型）。
