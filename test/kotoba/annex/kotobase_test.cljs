@@ -1,46 +1,69 @@
 (ns kotoba.annex.kotobase-test
+  "kotobase.net store client のテスト。実 kotobase.net は叩かず、
+   `net.kotobase.store.{put,get}` の JSON 契約を mock fetch で模す。
+   identity は注入して実鍵を作らない（テストが .kotoba-annex を汚さない）。"
   (:require [clojure.test :refer [deftest is testing async]]
+            [ed25519.core :as ed]
             [kotoba.annex.kotobase :as kb]))
 
-;; in-memory な blob サーバを mock fetch で表現（kotobase blob 面の HTTP 契約を模す）
-(defn mock-fetch [backing]
+;; テスト用の固定 seed（本番鍵ではない。テスト専用の使い捨て）
+(def test-seed (ed/unhex (apply str (repeat 64 "a"))))
+(def test-identity {:seed test-seed :did (ed/did-key-from-seed test-seed)})
+
+(defn mock-fetch
+  "net.kotobase.store.{put,get} の JSON 契約を模す in-memory サーバ。"
+  [backing]
   (fn [u & [opts]]
     (let [o (or opts #js {})
-          method (or (.-method o) "GET")
-          key (second (re-find #"key=([^&]+)" u))
-          k (js/decodeURIComponent key)]
+          body (js->clj (js/JSON.parse (.-body o)) :keywordize-keys true)
+          k (:key body)]
       (js/Promise.resolve
        (cond
-         (re-find #"blob\.put" u)
-         (do (swap! backing assoc k (.-body o)) #js {:ok true})
-         (re-find #"blob\.head" u)
-         #js {:ok (contains? @backing k)}
-         (re-find #"blob\.get" u)
+         (re-find #"store\.put" u)
+         (do (swap! backing assoc k (:val body)) #js {:ok true})
+         (re-find #"store\.get" u)
          (if (contains? @backing k)
-           #js {:ok true :arrayBuffer (fn [] (js/Promise.resolve (get @backing k)))}
+           #js {:ok true :json (fn [] (js/Promise.resolve
+                                       (clj->js {:ok true :val (get @backing k)})))}
            #js {:ok false})
-         (re-find #"blob\.remove" u)
-         (do (swap! backing dissoc k) #js {:ok true})
          :else #js {:ok false})))))
 
 (deftest kotobase-store-roundtrip
-  (testing "kotobase store が blob 面契約で store→present→retrieve→remove を回す"
+  (testing "store→present?→retrieve が net.kotobase.store 契約で回る"
     (async done
       (let [backing (atom {})
             s (kb/kotobase-store {:endpoint "https://kotobase.net"
-                                  :graph "test-assets"
+                                  :identity test-identity
                                   :fetch (mock-fetch backing)})
             key "SHA256E-s3--abc"
             bytes (js/Buffer.from #js [1 2 3])]
         (-> ((:store! s) key bytes)
-            (.then (fn [ok] (is ok "store ok")))
+            (.then (fn [ok] (is ok "store! ok")))
             (.then (fn [_] ((:present? s) key)))
             (.then (fn [p] (is (= :yes p) "present after store")))
             (.then (fn [_] ((:retrieve s) key)))
-            (.then (fn [b] (is (= (vec (js/Array.from b)) (vec (js/Array.from bytes))) "retrieved bytes match")))
-            (.then (fn [_] ((:remove! s) key)))
-            (.then (fn [_] ((:present? s) key)))
-            (.then (fn [p] (is (= :no p) "absent after remove") (done))))))))
+            (.then (fn [b] (is (= (vec (js/Array.from b)) (vec (js/Array.from bytes)))
+                               "retrieved bytes match")))
+            (.then (fn [_] ((:present? s) "no-such-key")))
+            (.then (fn [p] (is (= :no p) "absent key") (done))))))))
 
-(deftest prepare-requires-config
-  (is (thrown? js/Error ((:prepare! (kb/kotobase-store {:fetch (fn [& _])})) {}))))
+(deftest max-value-guard
+  (testing "istore の max-value-bytes を超える値は投げる（git-annex chunk を促す）"
+    (let [s (kb/kotobase-store {:identity test-identity :fetch (fn [& _])})]
+      (is (thrown? js/Error
+                   ((:store! s) "K" (js/Buffer.alloc (inc kb/max-value-bytes))))))))
+
+(deftest resources-and-aud
+  (testing "CACAO の aud は did:web:kotobase.net（pod が enforce）、resources は graph scope"
+    (is (= "did:web:kotobase.net" kb/kotobase-aud))
+    (let [r (kb/kotobase-resources "did:key:zTest")]
+      (is (some #(= "kotoba://op/datom:read" %) r))
+      (is (some #(= "kotoba://op/datom:transact" %) r))
+      (is (some #(= "kotoba://graph/did:key:zTest" %) r)))))
+
+(deftest mint-auth-shape
+  (testing "自己 mint した CACAO が Authorization/x-kotoba-did ヘッダを返す"
+    (let [auth (kb/mint-auth {:identity test-identity})]
+      (is (re-find #"^CACAO " (:authorization auth)))
+      (is (= (:did test-identity) (:x-kotoba-did auth)) "iss = 自分の did:key")
+      (is (= (:did test-identity) (:graph auth)) "graph 既定 = 自分の did（自己所有）"))))

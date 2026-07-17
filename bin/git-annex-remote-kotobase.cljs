@@ -13,6 +13,7 @@
   (:require [kotoba.annex.protocol :as proto]
             [kotoba.annex.store :as store]
             [kotoba.annex.directory :as dir]
+            [kotoba.annex.kotobase :as kb]
             ["fs" :as fs]
             ["readline" :as readline]))
 
@@ -26,25 +27,37 @@
 ;; kotobase 接続は follow-up（endpoint/graph を GETCONFIG で取る）。
 (defn ensure-store! []
   (when-not (:store @state)
-    ;; 既定は directory store（環境変数 KOTOBA_ANNEX_DIR、無ければ ./annex-blocks）
-    (let [d (or (some-> js/process.env.KOTOBA_ANNEX_DIR) "annex-blocks")]
-      (swap! state assoc :store (dir/directory-store d))))
+    ;; KOTOBASE_ENDPOINT があれば kotobase.net store（CACAO 自己 mint で認証、
+    ;; 鍵は .kotoba-annex/identity.edn に自己生成 — owner の token 受け渡し不要）。
+    ;; 無ければ directory store（KOTOBA_ANNEX_DIR、既定 ./annex-blocks）。
+    (let [ep js/process.env.KOTOBASE_ENDPOINT]
+      (swap! state assoc :store
+             (if (and ep (not= ep ""))
+               (kb/kotobase-store {:endpoint ep
+                                   :graph js/process.env.KOTOBASE_GRAPH})
+               (dir/directory-store (or js/process.env.KOTOBA_ANNEX_DIR "annex-blocks"))))))
   (:store @state))
+
+;; store 契約の関数は directory では同期値、kotobase では Promise を返す。
+;; どちらでも動くよう Promise.resolve で正規化してから応答する。
+(defn- p [x] (js/Promise.resolve x))
 
 (defn handle-transfer [args]
   (let [[direction key file] args
         s (ensure-store!)]
     (case direction
       "STORE"
-      (let [ok (try (let [bytes (fs/readFileSync file)]
-                      ((:store! s) key bytes))
-                    (catch :default _ false))]
-        (out (proto/transfer-response "STORE" key (boolean ok))))
+      (-> (p (let [bytes (fs/readFileSync file)] ((:store! s) key bytes)))
+          (.then (fn [ok] (out (proto/transfer-response "STORE" key (boolean ok)))))
+          (.catch (fn [_] (out (proto/transfer-response "STORE" key false)))))
       "RETRIEVE"
-      (let [ok (try (let [bytes ((:retrieve s) key)]
-                      (when bytes (fs/writeFileSync file bytes) true))
-                    (catch :default _ false))]
-        (out (proto/transfer-response "RETRIEVE" key (boolean ok))))
+      (-> (p ((:retrieve s) key))
+          (.then (fn [bytes]
+                   (if bytes
+                     (do (fs/writeFileSync file bytes)
+                         (out (proto/transfer-response "RETRIEVE" key true)))
+                     (out (proto/transfer-response "RETRIEVE" key false)))))
+          (.catch (fn [_] (out (proto/transfer-response "RETRIEVE" key false)))))
       (out (proto/transfer-response (str direction) key false)))))
 
 (defn handle-line [line]
@@ -54,8 +67,17 @@
       :PREPARE (out (if ((:prepare! s) (:config @state)) "PREPARE-SUCCESS"
                         "PREPARE-FAILURE prepare failed"))
       :TRANSFER (handle-transfer args)
+      ;; CHECKPRESENT / REMOVE は store が Promise を返しうるので bin で await
+      :CHECKPRESENT (let [k (first args)]
+                      (-> (p ((:present? s) k))
+                          (.then (fn [r] (out (proto/present-response k r))))
+                          (.catch (fn [_] (out (proto/present-response k :unknown))))))
+      :REMOVE (let [k (first args)]
+                (-> (p ((:remove! s) k))
+                    (.then (fn [ok] (out (proto/remove-response k (boolean ok)))))
+                    (.catch (fn [_] (out (proto/remove-response k false))))))
       :unknown nil
-      ;; その他はプロトコルの simple-response で処理
+      ;; その他（EXTENSIONS/LISTCONFIGS/GETCOST/INITREMOTE…）は同期
       (if-let [r (proto/simple-response parsed s)]
         (out r)
         ;; 未対応コマンドは UNSUPPORTED-REQUEST（git-annex はスキップする）
