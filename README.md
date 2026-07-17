@@ -20,8 +20,8 @@ block store — the annex key *is* the block cid.
 
 ## Verified
 
-The special remote is **verified end-to-end against real `git-annex`** (v10) with
-the directory store:
+The special remote is **verified end-to-end against real `git-annex`** (v10) —
+with the directory store *and* against **real kotobase.net**（下記）:
 
 ```
 git annex initremote kotobase type=external externaltype=kotobase encryption=none
@@ -98,17 +98,11 @@ STORE ok / RETRIEVE (checksum) ok / fsck ok。tenant を `store.list` すると 
 
 ## backend 一覧
 
-The directory backend is fully working & verified. The **kotobase.net backend
-client is written and unit-tested (mock fetch)** but needs one server-side piece:
-
-- kotobase-server's public XRPC surface is Datomic-oriented
-  (`datoms/transact/q/…`); raw block put/get is the *internal* injected store.
-  To let git-annex store blobs directly, kotobase-server needs a thin **blob
-  surface** exposing its `put!/get-fn/head` as
-  `ai.gftd.apps.kotobase.blob.{put,get,head,remove}`. This client is written
-  against exactly that contract.
-- That server addition + deploy + credentials are **owner-gated** (see
-  ADR-2607175000). Until then, use `store=directory` (or B2 as in `m365-archive`).
+| backend | 状態 | 用途 |
+|---|---|---|
+| `directory`（既定） | ✓ 全操作 + 暗号化を実 git-annex 検証済み | ローカル / オフライン / CI |
+| `kotobase.net`（`KOTOBASE_ENDPOINT` 設定時） | ✓ 実 git-annex → 実 kotobase.net で往復検証済み（`chunk=32KiB` 必須） | 共有・恒久保存 |
+| B2 S3 special remote | 既存（`m365-archive` 先例、本 remote 非経由） | 大容量アーカイブ |
 
 ## Test
 
