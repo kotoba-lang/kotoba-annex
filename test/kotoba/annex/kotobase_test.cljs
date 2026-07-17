@@ -22,10 +22,13 @@
          (re-find #"store\.put" u)
          (do (swap! backing assoc k (:val body)) #js {:ok true})
          (re-find #"store\.get" u)
+         ;; ⚠ 実 kotobase は **キー不在でも HTTP 200** を返し body が {:ok false}。
+         ;; mock もその実挙動を模す（HTTP status だけ見る実装を回帰で殺すため）。
          (if (contains? @backing k)
            #js {:ok true :json (fn [] (js/Promise.resolve
                                        (clj->js {:ok true :val (get @backing k)})))}
-           #js {:ok false})
+           #js {:ok true :json (fn [] (js/Promise.resolve
+                                       (clj->js {:ok false :error "NotFound"})))})
          :else #js {:ok false})))))
 
 (deftest kotobase-store-roundtrip
@@ -67,3 +70,14 @@
       (is (re-find #"^CACAO " (:authorization auth)))
       (is (= (:did test-identity) (:x-kotoba-did auth)) "iss = 自分の did:key")
       (is (= (:did test-identity) (:graph auth)) "graph 既定 = 自分の did（自己所有）"))))
+
+(deftest absent-key-returns-http200-with-error-body
+  (testing "**回帰テスト**: 実 kotobase は不在キーでも HTTP 200 + {:ok false} を返す。
+            HTTP status だけで判定すると present? が誤って :yes を返し、git-annex が
+            STORE を丸ごとスキップして『保存したのに空』になる（2026-07-17 実測の不具合）"
+    (async done
+      (let [s (kb/kotobase-store {:identity test-identity :fetch (mock-fetch (atom {}))})]
+        (-> ((:present? s) "absent-key")
+            (.then (fn [p] (is (= :no p) "HTTP200+{:ok false} を :no と判定すること")))
+            (.then (fn [_] ((:retrieve s) "absent-key")))
+            (.then (fn [b] (is (nil? b) "不在キーの retrieve は nil") (done))))))))
