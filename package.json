@@ -1,0 +1,6 @@
+{
+  "name": "kotoba-annex",
+  "description": "git-annex external special remote persisting content-addressed blocks to kotobase.net (or a local directory)",
+  "private": true,
+  "bin": { "git-annex-remote-kotobase": "bin/git-annex-remote-kotobase.cljs" }
+}
