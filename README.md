@@ -32,6 +32,21 @@ git annex get  sample.wav --from kotobase    # RETRIEVE -> checksum ok
 git annex fsck sample.wav                     # content integrity ok
 ```
 
+### Verification matrix (all against real `git-annex` v10)
+
+| operation | encryption=none | encryption=shared |
+|---|---|---|
+| STORE (`copy --to`)        | ✓ block keyed by annex key | ✓ block keyed by `GPGHMACSHA256--…` |
+| RETRIEVE (`get --from`)    | ✓ checksum ok | ✓ decrypt + checksum ok |
+| CHECKPRESENT (`fsck`/`whereis`) | ✓ | ✓ |
+| REMOVE (`drop --from`)     | ✓ block store 1→0 | — |
+| **at rest**                | plaintext block | **encrypted block** (block sha ≠ plaintext sha) |
+
+encryption is transparent to the remote: git-annex encrypts before STORE and
+decrypts after RETRIEVE; the remote stores/serves opaque blocks. Use
+`encryption=shared` for non-public assets (audio/video with proprietary voices,
+private datasets), `encryption=none` for public/regenerable content.
+
 ## Layout
 
 - `src/kotoba/annex/protocol.cljc` — pure external-special-remote protocol
