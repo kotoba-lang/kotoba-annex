@@ -1,10 +1,16 @@
-;; nbb テストランナー: nbb --classpath src:test test/run.cljs
+;; nbb テストランナー:
+;;   nbb --classpath "src:test:<net-kotobase>/clj-edge/src:<cacao>/src:<ed25519>/src:<cbor>/src" test/run.cljs
+;; cid-test は **本番 net-kotobase の kotobase.archive-put** を classpath に載せて
+;; 突き合わせる（自作 encode ↔ 自作 decode で閉じない）。README の Test 節参照。
 (ns run
   (:require [clojure.test :as t]
             [kotoba.annex.protocol-test]
-            [kotoba.annex.kotobase-test]))
+            [kotoba.annex.kotobase-test]
+            [kotoba.annex.cid-test]
+            [kotoba.annex.archive-test]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (when-not (t/successful? m) (set! (.-exitCode js/process) 1)))
 
-(t/run-tests 'kotoba.annex.protocol-test 'kotoba.annex.kotobase-test)
+(t/run-tests 'kotoba.annex.protocol-test 'kotoba.annex.kotobase-test
+             'kotoba.annex.cid-test 'kotoba.annex.archive-test)

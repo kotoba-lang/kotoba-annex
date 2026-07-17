@@ -14,6 +14,7 @@
             [kotoba.annex.store :as store]
             [kotoba.annex.directory :as dir]
             [kotoba.annex.kotobase :as kb]
+            [kotoba.annex.archive :as arc]
             ["fs" :as fs]
             ["readline" :as readline]))
 
@@ -27,14 +28,27 @@
 ;; kotobase 接続は follow-up（endpoint/graph を GETCONFIG で取る）。
 (defn ensure-store! []
   (when-not (:store @state)
-    ;; KOTOBASE_ENDPOINT があれば kotobase.net store（CACAO 自己 mint で認証、
-    ;; 鍵は .kotoba-annex/identity.edn に自己生成 — owner の token 受け渡し不要）。
-    ;; 無ければ directory store（KOTOBA_ANNEX_DIR、既定 ./annex-blocks）。
-    (let [ep js/process.env.KOTOBASE_ENDPOINT]
+    ;; backend の選択（優先順位。ADR-2607175000 の層評価に従う）:
+    ;; 1. KOTOBASE_ARCHIVE_TOKEN → **archive store**（PUT /ipfs/:cid → B2）。
+    ;;    層として正しい経路。生バイト列・4MiB・chunk 不要。認証は静的 Bearer で
+    ;;    置いたものは public gateway で公開される（秘匿が要るなら encryption=shared）。
+    ;; 2. KOTOBASE_ENDPOINT → kotobase istore/KV store（CACAO 自己 mint）。
+    ;;    **層を誤っている**（billing と同居の KV、chunk 必須、~25KB/s）。
+    ;;    tenant 分離が要る小さい値の実験にだけ使う。大量アップロードに使わない。
+    ;; 3. どちらも無ければ directory store（KOTOBA_ANNEX_DIR、既定 ./annex-blocks）。
+    (let [atok js/process.env.KOTOBASE_ARCHIVE_TOKEN
+          ep js/process.env.KOTOBASE_ENDPOINT]
       (swap! state assoc :store
-             (if (and ep (not= ep ""))
-               (kb/kotobase-store {:endpoint ep
-                                   :graph js/process.env.KOTOBASE_GRAPH})
+             (cond
+               (and atok (not= atok ""))
+               (arc/archive-store {:endpoint (or (and ep (not= ep "") ep)
+                                                 arc/default-endpoint)
+                                   :token atok})
+
+               (and ep (not= ep ""))
+               (kb/kotobase-store {:endpoint ep :graph js/process.env.KOTOBASE_GRAPH})
+
+               :else
                (dir/directory-store (or js/process.env.KOTOBA_ANNEX_DIR "annex-blocks"))))))
   (:store @state))
 
